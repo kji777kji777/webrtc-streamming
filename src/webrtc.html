@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>WebRTC 32-CH Pro Console V12.7</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; margin: 0; padding: 0; background: #000; color: #fff; overflow: hidden; }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 0 20px; background: #1a1a1a; height: 60px; border-bottom: 2px solid #333; }
+        .main-container { display: flex; height: calc(100vh - 60px); }
+        .side-panel { width: 240px; background: #111; padding: 15px; border-right: 1px solid #333; display: flex; flex-direction: column; gap: 12px; }
+        #localVideo { width: 100%; border-radius: 6px; background: #000; transform: scaleX(-1); border: 1px solid #444; }
+        .content-area { flex: 1; position: relative; background: #050505; }
+        .monitor-grid { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(4, 1fr); gap: 2px; width: 100%; height: 100%; }
+        .monitor-grid.hidden { display: none; }
+        .remote-item { background: #111; position: relative; border: 1px solid #222; overflow: hidden; }
+        .remote-item video { width: 100%; height: 100%; object-fit: cover; cursor: pointer; }
+        .item-info { position: absolute; top: 0; left: 0; width: 100%; background: rgba(0,0,0,0.8); font-size: 11px; padding: 4px 6px; display: flex; justify-content: space-between; z-index: 10; }
+        #spotlightOverlay { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 2000; flex-direction: column; }
+        #spotlightVideo { width: 100%; height: 100%; object-fit: contain; }
+        .spotlight-ui { position: absolute; top: 20px; right: 20px; z-index: 2100; }
+        button { border: none; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; color: white; }
+        .btn-blue { background: #007aff; } .btn-red { background: #ff3b30; } .btn-yellow { background: #ffcc00; color: #000; }
+        .status-on { color: #34c759; cursor: pointer; text-decoration: underline; }
+        .status-off { color: #ff3b30; cursor: pointer; text-decoration: underline; }
+        #log { font-size: 11px; color: #888; overflow-y: auto; flex-grow: 1; border-top: 1px solid #333; padding-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <strong style="color: #34c759; font-size: 1.2em;">V12.7 SOURCE DIAGNOSTIC</strong>
+        <div style="display: flex; align-items: center; gap: 15px;">
+            <select id="qualityPreset" style="padding: 5px; border-radius: 4px; background: #333; color: white;">
+                <option value="SD">480p</option>
+                <option value="HD" selected>720p</option>
+                <option value="FHD">1080p</option>
+            </select>
+            <button id="btnAllToggle" class="btn-yellow" style="padding: 8px 16px;">전체 채널 연결</button>
+        </div>
+    </div>
+    
+    <div class="main-container">
+        <div class="side-panel">
+            <video id="localVideo" autoplay playsinline muted></video>
+            <button id="btnSystemToggle" class="btn-blue" style="padding: 12px;">SYSTEM ON</button>
+            <!-- 로컬 원본 확대 버튼 -->
+            <button id="btnLocalExpand" class="btn-yellow" style="padding: 10px; font-size: 0.9em; display: none;">SOURCE RAW VIEW</button>
+            <div id="log"></div>
+        </div>
+        <div class="content-area">
+            <div id="monitorGrid" class="monitor-grid"></div>
+            <div id="spotlightOverlay">
+                <div class="spotlight-ui"><button id="btnCloseSpot" class="btn-red" style="padding: 10px 20px;">닫기 (ESC)</button></div>
+                <video id="spotlightVideo" autoplay playsinline></video>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const CONFIG = {
+            SD:  { h: 480, gridKbps: 150, gridFps: 7, spotKbps: 3000, spotFps: 30, scale: 2.5 },
+            HD:  { h: 720, gridKbps: 250, gridFps: 10, spotKbps: 6000, spotFps: 30, scale: 3 },
+            FHD: { h: 1080, gridKbps: 400, gridFps: 10, spotKbps: 10000, spotFps: 30, scale: 4 }
+        };
+
+        let localStream = null;
+        let channels = [];
+        let isSpotlight = false;
+
+        const monitorGrid = document.getElementById('monitorGrid');
+        const spotlightOverlay = document.getElementById('spotlightOverlay');
+        const spotlightVideo = document.getElementById('spotlightVideo');
+        const qualityPreset = document.getElementById('qualityPreset');
+
+        function log(msg) {
+            const time = new Date().toLocaleTimeString();
+            const logBox = document.getElementById('log');
+            logBox.innerHTML = `<div>[${time}] ${msg}</div>` + logBox.innerHTML;
+        }
+
+        for(let i=1; i<=32; i++) {
+            const item = document.createElement('div');
+            item.className = 'remote-item';
+            item.innerHTML = `<div class="item-info">CH${i} <span id="st${i}" class="status-off">OFF</span></div><video id="v${i}" autoplay playsinline muted></video>`;
+            const v = item.querySelector('video');
+            const st = item.querySelector('#st' + i);
+            v.onclick = () => openSpotlight(i);
+            st.onclick = () => channels[i-1].pc1 ? stopChannel(i) : startChannel(i);
+            monitorGrid.appendChild(item);
+            channels.push({ id: i, pc1: null, pc2: null, video: v, statusLabel: st, stream: null });
+        }
+
+        async function startChannel(chId) {
+            const ch = channels[chId-1];
+            if (!localStream) return;
+            try {
+                ch.pc1 = new RTCPeerConnection();
+                ch.pc2 = new RTCPeerConnection();
+                ch.pc1.onicecandidate = e => e.candidate && ch.pc2.addIceCandidate(e.candidate);
+                ch.pc2.onicecandidate = e => e.candidate && ch.pc1.addIceCandidate(e.candidate);
+                ch.pc2.ontrack = e => {
+                    ch.stream = e.streams[0];
+                    ch.video.srcObject = ch.stream;
+                };
+                localStream.getTracks().forEach(track => ch.pc1.addTrack(track, localStream));
+                const offer = await ch.pc1.createOffer();
+                await ch.pc1.setLocalDescription(offer);
+                await ch.pc2.setRemoteDescription(offer);
+                const answer = await ch.pc2.createAnswer();
+                await ch.pc2.setLocalDescription(answer);
+                await ch.pc1.setRemoteDescription(answer);
+                await setEngine(ch, false);
+                ch.statusLabel.textContent = "ON";
+                ch.statusLabel.className = "status-on";
+            } catch (e) { console.error(e); }
+        }
+
+        async function setEngine(ch, isSpot) {
+            if (!ch.pc1) return;
+            const sender = ch.pc1.getSenders().find(s => s.track?.kind === 'video');
+            if (!sender) return;
+            const c = CONFIG[qualityPreset.value];
+            const params = sender.getParameters();
+            params.encodings = [{
+                maxBitrate: (isSpot ? c.spotKbps : c.gridKbps) * 1000,
+                maxFramerate: isSpot ? c.spotFps : c.gridFps,
+                scaleResolutionDownBy: isSpot ? 1.0 : c.scale,
+                priority: isSpot ? 'high' : 'low'
+            }];
+            params.degradationPreference = isSpot ? 'maintain-resolution' : 'balanced';
+            await sender.setParameters(params);
+        }
+
+        async function openSpotlight(id) {
+            const ch = channels[id-1];
+            if (!ch.stream || isSpotlight) return;
+            isSpotlight = true;
+            channels.forEach(c => {
+                if (c.id !== id && c.stream) {
+                    c.stream.getVideoTracks().forEach(t => t.enabled = false);
+                }
+            });
+            monitorGrid.classList.add('hidden');
+            spotlightOverlay.style.display = 'flex';
+            const sender = ch.pc1.getSenders().find(s => s.track?.kind === 'video');
+            if (sender && sender.track) {
+                sender.track.enabled = false;
+                await setEngine(ch, true);
+                setTimeout(() => { if(sender.track) sender.track.enabled = true; }, 50);
+            }
+            spotlightVideo.srcObject = ch.stream;
+        }
+
+        async function closeSpotlight() {
+            if (!isSpotlight) return;
+            spotlightVideo.srcObject = null;
+            spotlightOverlay.style.display = 'none';
+            monitorGrid.classList.remove('hidden');
+            for (const ch of channels) {
+                if (ch.stream) {
+                    await setEngine(ch, false);
+                    ch.stream.getVideoTracks().forEach(t => t.enabled = true);
+                }
+            }
+            isSpotlight = false;
+        }
+
+        // [수정 포인트] 로컬 원본 영상 팝업 표출 버그 해결
+        document.getElementById('btnLocalExpand').onclick = () => {
+            if (!localStream) return;
+            
+            const preset = qualityPreset.value;
+            const c = CONFIG[preset];
+            const w = (preset === 'FHD') ? 1920 : (preset === 'HD' ? 1280 : 854);
+            const h = (preset === 'FHD') ? 1080 : (preset === 'HD' ? 720 : 480);
+
+            const rawWin = window.open("", "_blank", `width=${w},height=${h}`);
+            
+            // HTML 구조를 먼저 정의
+            const htmlContent = `
+                <!DOCTYPE html>
+                <html>
+                <head><title>RAW SOURCE VIEW</title></head>
+                <body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;">
+                    <video id="rawV" autoplay playsinline muted style="width:100%; height:100%; object-fit:contain; transform: scaleX(-1);"></video>
+                    <div style="position:fixed;top:10px;left:10px;color:#34c759;font-weight:bold;background:rgba(0,0,0,0.7);padding:8px;border-radius:4px;font-family:sans-serif;z-index:100;">
+                        LOCAL RAW SOURCE (${preset})
+                    </div>
+                </body>
+                </html>
+            `;
+            rawWin.document.write(htmlContent);
+            rawWin.document.close();
+
+            // 중요: 팝업창의 비디오 객체가 메모리에 준비될 때까지 잠시 대기 후 스트림 할당
+            setTimeout(() => {
+                const rawV = rawWin.document.getElementById('rawV');
+                if (rawV) {
+                    rawV.srcObject = localStream;
+                    rawV.play().catch(err => console.error("Popup Play Error:", err));
+                    log(`로컬 원본 팝업 스트림 연결 완료 (${preset})`);
+                }
+            }, 300); // 300ms 지연으로 DOM 안정성 확보
+        };
+
+        setInterval(() => {
+            const syncVideo = (v) => {
+                if (v && v.readyState >= 2 && v.buffered.length > 0) {
+                    const drift = v.buffered.end(0) - v.currentTime;
+                    if (drift > 1.0) v.currentTime = v.buffered.end(0) - 0.1;
+                    else if (drift > 0.15) v.playbackRate = 1.08;
+                    else v.playbackRate = 1.0;
+                }
+            };
+            if (isSpotlight) syncVideo(spotlightVideo);
+            else channels.forEach(ch => { if(ch.pc1) syncVideo(ch.video); });
+        }, 500);
+
+        document.getElementById('btnCloseSpot').onclick = closeSpotlight;
+
+        function stopChannel(chId) {
+            const ch = channels[chId-1];
+            if (ch.pc1) {
+                ch.pc1.close(); ch.pc2.close();
+                ch.pc1 = null; ch.pc2 = null; ch.stream = null;
+                ch.video.srcObject = null;
+                ch.statusLabel.textContent = "OFF";
+                ch.statusLabel.className = "status-off";
+            }
+        }
+
+        document.getElementById('btnSystemToggle').onclick = async () => {
+            const btn = document.getElementById('btnSystemToggle');
+            const expandBtn = document.getElementById('btnLocalExpand');
+            if (!localStream) {
+                try {
+                    localStream = await navigator.mediaDevices.getUserMedia({ 
+                        video: { width: 1920, height: 1080, frameRate: 30 }, 
+                        audio: false 
+                    });
+                    document.getElementById('localVideo').srcObject = localStream;
+                    btn.textContent = "SYSTEM OFF";
+                    btn.className = "btn-red";
+                    expandBtn.style.display = "block";
+                    log("시스템 시작: 카메라 원본 획득 완료");
+                } catch (e) { alert("CAM Error: " + e.message); }
+            } else { location.reload(); }
+        };
+
+        document.getElementById('btnAllToggle').onclick = async () => {
+            if (!localStream) return;
+            const btn = document.getElementById('btnAllToggle');
+            const isConnecting = btn.classList.contains('btn-yellow');
+            btn.disabled = true;
+            if (isConnecting) {
+                for (const ch of channels) { if (!ch.pc1) { await startChannel(ch.id); await new Promise(r => setTimeout(r, 40)); } }
+                btn.textContent = "전체 연결 해제";
+                btn.className = "btn-red";
+            } else {
+                channels.forEach(ch => stopChannel(ch.id));
+                btn.textContent = "전체 채널 연결";
+                btn.className = "btn-yellow";
+            }
+            btn.disabled = false;
+        };
+
+        window.onkeydown = (e) => { if(e.key === 'Escape') closeSpotlight(); };
+    </script>
+</body>
+</html>
